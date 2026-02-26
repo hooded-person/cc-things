@@ -112,8 +112,7 @@ local function addProcessFile(name, entrypoint)
 
     process.task = loop:addTask(function()
         term.redirect(process.win)
-        ---@diagnostic disable-next-line: undefined-field
-        os.run({}, entrypoint, process.shared)
+        shell.execute(entrypoint, textutils.serialise(process.shared, { compact = true }))
         term.redirect(parentTerm)
     end)
 
