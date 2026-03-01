@@ -4,13 +4,29 @@
 -- Made by kinggreen
 -- Licensed under the MIT license
 
-local loop = require("taskmaster")()
+local loop = require "taskmaster" ()
 local defaultEventBlacklist = { "key", "key_up", "char", "paste", "mouse_click", "mouse_up", "mouse_scroll", "mouse_drag" }
 loop:setEventBlacklist(defaultEventBlacklist)
 
+-- CONFIG
 local base_dir = "/programs"
 local data_dir = "/data"
 local confirmKillTimeout = 1
+-- keep alive
+local config = {
+    keep_alive = {
+        max_retries = 5, ---@field max_retries number The amount of retries that will be attempted in `retry_timespan` seconds. Set to -1 to auto-restart infinitly.
+        retry_timespan = 5 * 60, ---@field retry_timespan number The maximum amount of seconds that can be between the `max_retries` ago fail and current time
+        retry_delay = 1, ---@field retry_delay number The amount of seconds to wait before restarting the process
+    },
+}
+-- CONFIG VALIDATION
+if config.keep_alive.retry_delay * config.keep_alive.max_retries > config.keep_alive.retry_timespan then
+    error(("Due to retry_delay (%d), processes can never fail %d times in %d seconds"):format(
+        config.keep_alive.retry_delay, config.keep_alive.max_retries, config.keep_alive.retry_timespan
+    ))
+end
+-- END CONFIG
 
 ---@class Process
 ---@field name string Name of the process
@@ -19,6 +35,9 @@ local confirmKillTimeout = 1
 ---@field task Task The taskmaster Task that this process is running in.
 ---@field confirmKill boolean Wether killing this process requires confirmation
 ---@field lastKillClick? number Epoch miliseconds (utc) when the kill button was last pressed
+---@field fails number[] Rolling window of the last `config.keep_alive.max_retries` fails epoch seconds. Index 1 is the newest.
+---@field dead boolean Wether the program has failed to many times (`config.keep_alive.max_retries`) within the configured timespan (`config.keep_alive.retry_timespan`)
+
 
 ---@type Process[]
 local processes = {}
@@ -59,6 +78,42 @@ local function deepCopyInto(source, destination)
     end
 end
 
+local function keepAlive(process, func)
+    process.fails = {}
+    process.dead = false
+    return function()
+        while not process.dead do
+            func()
+            local now = os.epoch("utc") / 1000
+            table.insert(process.fails, 1, now)
+            if config.keep_alive.max_retries ~= -1 and #process.fails >= config.keep_alive.max_retries and now - process.fails[config.keep_alive.max_retries] < config.keep_alive.retry_timespan then
+                process.dead = true
+                local oldTerm = term.current()
+                term.redirect(process.win)
+                local oldColor = term.getTextColor()
+                term.setTextColor(colors.red)
+                print(("Process failed %d times in %d seconds. Stopping auto-restart"):format(
+                    config.keep_alive.max_retries,
+                    now - process.fails[config.keep_alive.max_retries]
+                ))
+                term.setTextColor(oldColor)
+                term.redirect(oldTerm)
+            else
+                local oldTerm = term.current()
+                term.redirect(process.win)
+                local oldColor = term.getTextColor()
+                term.setTextColor(colors.red)
+                print(("Auto restarting in %d second(s)"):format(config.keep_alive.retry_delay))
+                term.setTextColor(oldColor)
+                term.redirect(oldTerm)
+            end
+            if #process.fails > config.keep_alive.max_retries then
+                table.remove(process.fails)
+            end
+        end
+    end
+end
+
 local function addProcess(name, func, options)
     options = options or {}
     local process = {
@@ -74,11 +129,13 @@ local function addProcess(name, func, options)
 
     process.win = window.create(parentTerm, 1, 2, width, height - 1, false)
 
-    process.task = loop:addTask(function()
-        term.redirect(process.win)
-        func()
-        term.redirect(parentTerm)
-    end)
+    process.task = loop:addTask(
+        keepAlive(process, function()
+            term.redirect(process.win)
+            func()
+            term.redirect(parentTerm)
+        end)
+    )
     if options.eventBlacklist ~= nil then
         process.task:setEventBlacklist(options.eventBlacklist)
     end
@@ -98,6 +155,9 @@ local function addProcessFile(name, entrypoint)
     elseif fs.isDir(entrypoint) then
         return false, "Entrypoint is not a file"
     end
+    if type(name) ~= "string" then
+        return false, "Name must be a string"
+    end
 
     local process = {
         name = name,
@@ -110,11 +170,13 @@ local function addProcessFile(name, entrypoint)
 
     process.win = window.create(parentTerm, 1, 2, width, height - 1, false)
 
-    process.task = loop:addTask(function()
-        term.redirect(process.win)
-        shell.execute(entrypoint, textutils.serialise(process.shared, { compact = true }))
-        term.redirect(parentTerm)
-    end)
+    process.task = loop:addTask(
+        keepAlive(process, function()
+            term.redirect(process.win)
+            shell.execute(entrypoint, textutils.serialise(process.shared, { compact = true }))
+            term.redirect(parentTerm)
+        end)
+    )
 
     return true, process
 end
@@ -126,14 +188,31 @@ end
 local serialised = h.readAll()
 h.close()
 local daemons = textutils.unserialise(serialised)
+if daemons == nil then
+    error("'daemons.lon' definition file is not a valid lua table")
+end
 
-for name, data in pairs(daemons) do
+for index, data in pairs(daemons) do
+    local name = index
     local entrypoint = data
     if type(data) == "table" then
         entrypoint = data.entrypoint
     end
 
-    addProcessFile(name, entrypoint)
+    if fs.exists("/" .. fs.combine(base_dir, entrypoint)) then
+        entrypoint = "/" .. fs.combine(base_dir, entrypoint)
+    end
+
+    if type(name) == "number" then
+        name = data.name
+            :lower()
+            :gsub(" ", "_")
+    end
+
+    local ok, err = addProcessFile(name, entrypoint)
+    if not ok then
+        print(tostring(index) .. ":" .. err)
+    end
 end
 
 -- daemon UI task
@@ -155,6 +234,7 @@ local function updateProcessList()
         processList[y] = name
         term.setCursorPos(1, y)
 
+        term.setTextColor(process.dead and colors.red or colors.white)
         write(name)
 
         term.setCursorPos(w - 8, y)
@@ -188,7 +268,7 @@ local function drawMainBar(name, showExitBtn)
     term.setCursorPos(1, 1)
     term.setTextColor(colors.white)
     term.setBackgroundColor(colors.gray)
-    write(name .. (" "):rep(w - #name))
+    term.write(name .. (" "):rep(w - #name))
 
     if showExitBtn then
         term.setCursorPos(w - 3, 1)
@@ -219,7 +299,14 @@ local function daemonUIClicks()
     -- openedProcessWindow = updateOpenedWindow(openedProcessWindow, "incremental")
 
     while true do
-        drawMainBar(openedProcessWindow or "Daemon UI", openedProcessWindow ~= nil)
+        drawMainBar(
+            openedProcessWindow == nil and "Daemon UI" or openedProcessWindow .. " (" .. processes[openedProcessWindow].entrypoint ..")",
+            openedProcessWindow ~= nil
+        )
+        if multishell then
+            multishell.setTitle(multishell.getCurrent(),
+                openedProcessWindow == nil and "Daemon UI" or "DUI:" .. openedProcessWindow)
+        end
         if openedProcessWindow == nil then
             updateProcessList()
         end
